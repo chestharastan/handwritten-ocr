@@ -1,0 +1,16 @@
+# secrets
+.env
+
+# data (backups, images, generated crops)
+database/
+dataset/
+
+# training outputs
+checkpoints/
+*.log
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
