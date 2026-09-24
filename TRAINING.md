@@ -6,6 +6,30 @@ Run every command from the project folder:
 cd ~/Desktop/ocr/khmer_hand
 ```
 
+## NVIDIA GPU setup
+
+On a machine with an NVIDIA card (for example an RTX 3060 6 GB), install the CUDA build of PyTorch **before** the other requirements. Otherwise pip installs the CPU-only build:
+
+```bash
+python -m venv .venv
+# Linux:   .venv/bin/pip ...        Windows:  .venv\Scripts\pip ...
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu124
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+The first line of `train.log` should read `Device cuda (bf16)`.
+
+Recommended settings for a 6 GB card:
+
+```bash
+.venv/bin/python -u train.py                          # defaults fit comfortably
+.venv/bin/python -u train.py --height 96              # taller input keeps Khmer stacked vowels/subscripts sharper; try if 64 plateaus
+.venv/bin/python -u train.py --height 96 --batch-size 12   # if you hit CUDA out of memory
+```
+
+On Windows, use `.venv\Scripts\python` and run training in its own terminal window instead of `nohup ... &`.
+
 ## 1. Prepare data (before a new training run)
 
 ```bash
@@ -37,7 +61,7 @@ pgrep -fl train.py         # is training still running?
 ```
 
 - Every epoch prints the loss.
-- Every 10 epochs it prints `val CER` (character error rate, lower is better).
+- Every 5 epochs it prints `val attn CER` and `ctc CER` (character error rate for each decoder, lower is better).
 - `* saved best` means `checkpoints/best.pt` was updated.
 
 ## 4. Stop

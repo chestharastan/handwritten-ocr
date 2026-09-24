@@ -2,3 +2,4 @@ torch
 pillow
 numpy
 psycopg[binary]
+khmer-nltk

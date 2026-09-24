@@ -13,3 +13,6 @@ checkpoints/
 __pycache__/
 *.pyc
 .DS_Store
+
+# generated viewer (rebuild with visualize_dataset.py)
+visualize/

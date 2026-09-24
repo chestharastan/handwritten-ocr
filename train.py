@@ -25,10 +25,12 @@ import random
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageFilter
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 ROOT = Path(__file__).resolve().parent
@@ -84,14 +86,36 @@ def load_line(img: Image.Image, height: int, max_width: int) -> torch.Tensor:
     return ((x - lo) / (hi - lo + 1e-6)).clamp(0, 1)
 
 
+def wave(img: Image.Image) -> Image.Image:
+    """Bend the baseline with a gentle sine wave, like a line written without ruling."""
+    a = np.asarray(img)
+    h, w = a.shape
+    amp = random.uniform(0.02, 0.06) * h
+    period = random.uniform(2, 6) * h
+    shift = np.round(amp * np.sin(2 * math.pi * np.arange(w) / period + random.uniform(0, 2 * math.pi)))
+    rows = np.arange(h)[:, None] - shift[None, :].astype(int)
+    inside = (rows >= 0) & (rows < h)
+    return Image.fromarray(np.where(inside, a[rows.clip(0, h - 1), np.arange(w)[None]], 255).astype(np.uint8))
+
+
 def augment(img: Image.Image) -> Image.Image:
+    # every geometric transform fills with white (255) so no fake ink appears at the edges
+    if random.random() < 0.5:  # slant: writers lean their letters differently
+        s = random.uniform(-0.3, 0.3)
+        pad = int(abs(s) * img.height)
+        img = img.transform((img.width + pad, img.height), Image.AFFINE,
+                            (1, s, -pad if s > 0 else 0, 0, 1, 0), Image.BILINEAR, fillcolor=255)
     if random.random() < 0.5:
         img = img.rotate(random.uniform(-2, 2), resample=Image.BILINEAR, expand=True, fillcolor=255)
+    if random.random() < 0.3:
+        img = wave(img)
     if random.random() < 0.5:  # horizontal stretch / squeeze
         img = img.resize((max(8, int(img.width * random.uniform(0.8, 1.2))), img.height), Image.BILINEAR)
-    if random.random() < 0.5:  # vertical crop / pad jitter
-        dy = int(img.height * random.uniform(-0.08, 0.08))
-        img = img.crop((0, dy, img.width, img.height + dy))
+    if random.random() < 0.5:  # vertical shift and loose / tight horizontal margins
+        dy = img.height * random.uniform(-0.08, 0.08)
+        left, right = (int(img.height * random.uniform(-0.1, 0.3)) for _ in range(2))
+        img = img.transform((max(8, img.width + left + right), img.height), Image.AFFINE,
+                            (1, 0, -left, 0, 1, dy), Image.BILINEAR, fillcolor=255)
     if random.random() < 0.5:
         img = ImageEnhance.Contrast(img).enhance(random.uniform(0.6, 1.4))
         img = ImageEnhance.Brightness(img).enhance(random.uniform(0.8, 1.2))
@@ -99,6 +123,10 @@ def augment(img: Image.Image) -> Image.Image:
         img = img.filter(ImageFilter.GaussianBlur(random.uniform(0.3, 1.2)))
     if random.random() < 0.2:  # thicker or thinner strokes
         img = img.filter(ImageFilter.MinFilter(3) if random.random() < 0.5 else ImageFilter.MaxFilter(3))
+    if random.random() < 0.3:  # scanner / paper noise
+        a = np.asarray(img, dtype=np.float32)
+        a = a + np.random.default_rng(random.getrandbits(32)).normal(0, random.uniform(3, 15), a.shape)
+        img = Image.fromarray(a.clip(0, 255).astype(np.uint8))
     return img
 
 
@@ -235,13 +263,27 @@ class OCRTransformer(nn.Module):
         return self.out(self.dec_norm(h))
 
     @torch.no_grad()
-    def greedy(self, x, widths, max_len=220):
-        memory, mask, _ = self.encode(x, widths)
+    def recognize(self, x, widths):
+        """Return (attention decoder ids, CTC head ids) from one encoder pass."""
+        memory, mask, lengths = self.encode(x, widths)
+        return self.greedy(memory, mask, int(lengths.max())), self.ctc_greedy(memory, lengths)
+
+    def ctc_greedy(self, memory, lengths):
+        best = self.ctc_head(memory).argmax(-1).cpu()
+        out = []
+        for seq, n in zip(best, lengths.cpu()):
+            s = seq[:n].tolist()
+            out.append([c for i, c in enumerate(s) if c != PAD and (i == 0 or c != s[i - 1])])
+        return out
+
+    @torch.no_grad()
+    def greedy(self, memory, mask, max_len):
+        b, device = memory.size(0), memory.device
         # PAD-filled buffer grown in steps of 32: the causal mask hides the unfilled
         # tail, and a few fixed shapes avoid a recompile at every step on MPS
-        ys = torch.full((x.size(0), 32), PAD, dtype=torch.long, device=x.device)
+        ys = torch.full((b, 32), PAD, dtype=torch.long, device=device)
         ys[:, 0] = SOS
-        done = torch.zeros(x.size(0), dtype=torch.bool, device=x.device)
+        done = torch.zeros(b, dtype=torch.bool, device=device)
         for i in range(max_len):
             if i + 1 >= ys.size(1):
                 ys = F.pad(ys, (0, 32), value=PAD)
@@ -266,23 +308,31 @@ def edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
-def evaluate(model, loader, tok, device, show=0):
+def evaluate(model, loader, tok, device, amp, show=0):
+    """Score both decoders. Returns {"attn": (cer, line_acc), "ctc": (cer, line_acc)}."""
     model.eval()
-    errors = chars = exact = n = 0
+    errors, exact = {"attn": 0, "ctc": 0}, {"attn": 0, "ctc": 0}
+    chars = n = 0
     samples = []
     for x, widths, _, texts in loader:
-        preds = model.greedy(x.to(device), widths.to(device))
-        for p, t in zip(preds.cpu(), texts):
-            pred = tok.decode(p)
-            errors += edit_distance(pred, t)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+            attn, ctc = model.recognize(x.to(device), widths.to(device))
+        for a, c, t in zip(attn.cpu(), ctc, texts):
+            preds = {"attn": tok.decode(a), "ctc": tok.decode(c)}
+            for k, pred in preds.items():
+                errors[k] += edit_distance(pred, t)
+                exact[k] += pred == t
             chars += len(t)
-            exact += pred == t
             n += 1
             if len(samples) < show:
-                samples.append((t, pred))
-    for t, p in samples:
-        print(f"    GT  : {t}\n    PRED: {p}")
-    return errors / max(1, chars), exact / max(1, n)
+                samples.append((t, preds))
+    for t, preds in samples:
+        print(f"    GT  : {t}\n    ATTN: {preds['attn']}\n    CTC : {preds['ctc']}")
+    return {k: (errors[k] / max(1, chars), exact[k] / max(1, n)) for k in errors}
+
+
+def report(scores):
+    return " | ".join(f"{k} CER {cer:.4f} acc {acc:.3f}" for k, (cer, acc) in scores.items())
 
 
 # ---------------------------------------------------------------------- main
@@ -299,15 +349,19 @@ def pick_device(name):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--height", type=int, default=64)
+    p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--height", type=int, default=64, help="multiple of 16")
     p.add_argument("--max-width", type=int, default=2048)
     p.add_argument("--ctc-weight", type=float, default=0.3)
-    p.add_argument("--eval-every", type=int, default=10)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--ema", type=float, default=0.999, help="EMA decay of weights used for eval (0 disables)")
+    p.add_argument("--eval-every", type=int, default=5)
+    p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     p.add_argument("--device", default="auto")
+    p.add_argument("--no-amp", action="store_true", help="disable bf16 mixed precision on CUDA")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true")
     args = p.parse_args()
@@ -315,33 +369,39 @@ def main():
     torch.manual_seed(0)
     random.seed(0)
     device = pick_device(args.device)
+    amp = device.type == "cuda" and torch.cuda.is_bf16_supported() and not args.no_amp
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     tok = Tokenizer((DATA_DIR / "charset.txt").read_text(encoding="utf-8"))
     splits = {s: read_tsv(DATA_DIR / f"{s}.tsv") for s in ("train", "val", "test")}
-    print(f"Device {device} | vocab {len(tok)} | "
+    print(f"Device {device}{' (bf16)' if amp else ''} | vocab {len(tok)} | "
           + " | ".join(f"{s} {len(r)}" for s, r in splits.items()))
 
     def loader(split, train):
         ds = LineDataset(splits[split], tok, args.height, args.max_width, train)
         sampler = WidthBucketSampler(splits[split], args.batch_size, shuffle=train)
-        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate,
-                          num_workers=args.workers, persistent_workers=args.workers > 0)
+        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=args.workers,
+                          persistent_workers=args.workers > 0, pin_memory=device.type == "cuda")
 
     train_dl, val_dl, test_dl = loader("train", True), loader("val", False), loader("test", False)
 
-    model = OCRTransformer(len(tok), height=args.height).to(device)
+    model = OCRTransformer(len(tok), height=args.height, dropout=args.dropout).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    # an exponential moving average of the weights generalises better than the raw
+    # weights on a small dataset; it is what gets evaluated and saved as best.pt
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema), use_buffers=True) if args.ema > 0 else None
+    eval_model = ema.module if ema else model
     CKPT_DIR.mkdir(exist_ok=True)
 
     if args.eval_only:
         ckpt = torch.load(CKPT_DIR / "best.pt", map_location=device)
         model.load_state_dict(ckpt["model"])
-        cer, acc = evaluate(model, test_dl, tok, device, show=10)
-        print(f"Test CER {cer:.4f} | line accuracy {acc:.3f}")
+        scores = evaluate(model, test_dl, tok, device, amp, show=10)
+        print(f"Test {report(scores)} | best.pt uses the {ckpt.get('decoder', 'attn')} decoder")
         return
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total = args.epochs * len(train_dl)
-    warmup = min(1000, total // 10)
+    warmup = max(1, min(1000, total // 10))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
     start_epoch, best_cer = 1, float("inf")
@@ -351,30 +411,36 @@ def main():
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         sched.load_state_dict(ckpt["sched"])
+        if ema and "ema" in ckpt:
+            ema.load_state_dict(ckpt["ema"])
         start_epoch, best_cer = ckpt["epoch"] + 1, ckpt["best_cer"]
         print(f"Resumed from epoch {ckpt['epoch']} (best val CER {best_cer:.4f})")
 
     ce = nn.CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.1)
+    ctc_device = torch.device("cpu") if device.type == "mps" else device  # no CTC kernel on MPS
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0, total_loss = time.time(), 0.0
         for step, (x, widths, y, _) in enumerate(train_dl, 1):
-            x, widths, y = x.to(device), widths.to(device), y.to(device)
-            memory, mask, frames = model.encode(x, widths)
-            logits = model.decode(y[:, :-1], memory, mask)
-            loss = ce(logits.reshape(-1, logits.size(-1)), y[:, 1:].reshape(-1))
+            x, widths, y = (t.to(device, non_blocking=True) for t in (x, widths, y))
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+                memory, mask, frames = model.encode(x, widths)
+                logits = model.decode(y[:, :-1], memory, mask)
+            loss = ce(logits.float().reshape(-1, logits.size(-1)), y[:, 1:].reshape(-1))
             if args.ctc_weight > 0:
                 targets = y[:, 1:]
                 target_lens = (targets != PAD).sum(1) - 1  # drop EOS
-                log_probs = model.ctc_head(memory).log_softmax(-1).transpose(0, 1)
-                ctc = F.ctc_loss(log_probs.cpu(), targets.cpu(), frames.cpu(), target_lens.cpu(),
-                                 blank=PAD, zero_infinity=True)
+                log_probs = model.ctc_head(memory.float()).log_softmax(-1).transpose(0, 1)
+                ctc = F.ctc_loss(log_probs.to(ctc_device), targets.to(ctc_device), frames.to(ctc_device),
+                                 target_lens.to(ctc_device), blank=PAD, zero_infinity=True)
                 loss = (1 - args.ctc_weight) * loss + args.ctc_weight * ctc.to(device)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
+            if ema:
+                ema.update_parameters(model)
             total_loss += loss.item()
             if step % 20 == 0:
                 print(f"  epoch {epoch} step {step}/{len(train_dl)} | loss {total_loss / step:.4f} | "
@@ -384,21 +450,25 @@ def main():
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             print("  evaluating on val...", flush=True)
-            cer, acc = evaluate(model, val_dl, tok, device, show=2)
-            msg += f" | val CER {cer:.4f} | line acc {acc:.3f}"
+            scores = evaluate(eval_model, val_dl, tok, device, amp, show=2)
+            decoder = min(scores, key=lambda k: scores[k][0])
+            cer = scores[decoder][0]
+            msg += f" | val {report(scores)}"
             if cer < best_cer:
                 best_cer = cer
-                torch.save({"model": model.state_dict(), "charset": tok.itos[len(SPECIALS):],
-                            "args": vars(args), "epoch": epoch, "val_cer": cer}, CKPT_DIR / "best.pt")
-                msg += "  * saved best"
+                torch.save({"model": eval_model.state_dict(), "charset": tok.itos[len(SPECIALS):],
+                            "args": vars(args), "epoch": epoch, "val_cer": cer, "decoder": decoder},
+                           CKPT_DIR / "best.pt")
+                msg += f"  * saved best ({decoder})"
         print(msg, flush=True)
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+        torch.save({"model": model.state_dict(), "ema": ema.state_dict() if ema else None,
+                    "opt": opt.state_dict(), "sched": sched.state_dict(),
                     "epoch": epoch, "best_cer": best_cer, "args": vars(args)}, CKPT_DIR / "last.pt")
 
     ckpt = torch.load(CKPT_DIR / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    cer, acc = evaluate(model, test_dl, tok, device, show=5)
-    print(f"Best model (epoch {ckpt['epoch']}) test CER {cer:.4f} | line accuracy {acc:.3f}")
+    scores = evaluate(model, test_dl, tok, device, amp, show=5)
+    print(f"Best model (epoch {ckpt['epoch']}, {ckpt['decoder']} decoder) test {report(scores)}")
 
 
 if __name__ == "__main__":
