@@ -1,0 +1,22 @@
+{
+  "backup": "2026-09-24_12-17-15",
+  "dropped": {
+    "empty text": 7,
+    "multi-line / too long": 19
+  },
+  "splits": {
+    "train": {
+      "pages": 118,
+      "lines": 2311
+    },
+    "val": {
+      "pages": 15,
+      "lines": 291
+    },
+    "test": {
+      "pages": 14,
+      "lines": 289
+    }
+  },
+  "charset_size": 117
+}

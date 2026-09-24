@@ -1,9 +1,8 @@
 # secrets
 .env
 
-# data (backups, images, generated crops)
+# data backups (raw pages, table dumps)
 database/
-dataset/
 
 # training outputs
 checkpoints/
