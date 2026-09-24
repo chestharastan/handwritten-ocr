@@ -1,0 +1,139 @@
+:root {
+  color-scheme: light;
+  --surface-0: #f4f3f0;
+  --surface-1: #fcfcfb;
+  --surface-2: #efeeea;
+  --border: #dddcd6;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #77766f;
+  --accent: #2a78d6;
+  --accent-soft: rgba(42, 120, 214, 0.14);
+  --active: #eb6834;
+  --active-soft: rgba(235, 104, 52, 0.18);
+  --good: #0c8a0c;
+  --bad: #c9352b;
+  --bad-soft: rgba(201, 53, 43, 0.1);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #242423;
+    --border: #383835;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #94938b;
+    --accent: #3987e5;
+    --accent-soft: rgba(57, 135, 229, 0.2);
+    --active: #e0662f;
+    --active-soft: rgba(224, 102, 47, 0.25);
+    --good: #3cc13c;
+    --bad: #ef6a5f;
+    --bad-soft: rgba(239, 106, 95, 0.14);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --surface-2: #242423;
+  --border: #383835;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #94938b;
+  --accent: #3987e5;
+  --accent-soft: rgba(57, 135, 229, 0.2);
+  --active: #e0662f;
+  --active-soft: rgba(224, 102, 47, 0.25);
+  --good: #3cc13c;
+  --bad: #ef6a5f;
+  --bad-soft: rgba(239, 106, 95, 0.14);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.km { font-family: var(--font-khmer), "Khmer Sangam MN", "Khmer MN", sans-serif; }
+button { font: inherit; }
+
+header {
+  display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-1);
+}
+header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+.status { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
+.dot { width: 8px; height: 8px; border-radius: 4px; background: var(--text-muted); flex: none; }
+.dot.ok { background: var(--good); }
+.dot.err { background: var(--bad); }
+
+main { padding: 16px; max-width: 1500px; margin: 0 auto; }
+.banner {
+  background: var(--bad-soft); border: 1px solid var(--bad); color: var(--text-primary);
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; overflow-wrap: anywhere;
+}
+.banner code { font-size: 12px; }
+
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+.btn {
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+  padding: 6px 12px; border-radius: 6px; cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--text-muted); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.primary { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
+.hint { color: var(--text-muted); font-size: 12px; }
+
+.workspace { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .workspace { grid-template-columns: minmax(0, 1fr); } }
+
+.dropzone {
+  border: 2px dashed var(--border); border-radius: 10px; background: var(--surface-1);
+  min-height: 360px; display: grid; place-items: center; text-align: center; padding: 24px;
+  color: var(--text-secondary); cursor: pointer;
+}
+.dropzone.over { border-color: var(--accent); background: var(--accent-soft); }
+.dropzone strong { display: block; color: var(--text-primary); font-size: 16px; margin-bottom: 4px; }
+
+.canvas-wrap { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 8px; }
+.canvas-wrap.over { border-color: var(--accent); }
+.stage { position: relative; width: 100%; line-height: 0; user-select: none; touch-action: none; }
+.stage img { width: 100%; height: auto; display: block; border-radius: 4px; pointer-events: none; }
+.stage svg { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+.stage rect.box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; cursor: move; }
+.stage rect.box.sel { fill: var(--active-soft); stroke: var(--active); stroke-width: 2.5; }
+.stage rect.handle { fill: var(--surface-1); stroke: var(--active); stroke-width: 2; }
+.stage text { fill: #fff; font-weight: 600; pointer-events: none; }
+.stage .tag { fill: var(--accent); }
+.stage .tag.sel { fill: var(--active); }
+
+.results { display: flex; flex-direction: column; gap: 8px; }
+.empty { color: var(--text-muted); background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; cursor: pointer; min-width: 0;
+}
+.card.sel { border-color: var(--active); box-shadow: 0 0 0 2px var(--active-soft); }
+.card-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); }
+.num {
+  min-width: 22px; height: 22px; border-radius: 11px; padding: 0 6px; display: inline-grid; place-items: center;
+  background: var(--accent); color: #fff; font-weight: 600; font-size: 12px;
+}
+.card.sel .num { background: var(--active); }
+.card-head .spacer { margin-left: auto; }
+.icon-btn { border: 0; background: none; color: var(--text-secondary); cursor: pointer; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+.icon-btn:hover { background: var(--surface-2); color: var(--text-primary); }
+.thumb { display: block; max-width: 100%; max-height: 64px; margin: 8px 0 4px; border-radius: 4px; background: #fff; border: 1px solid var(--border); }
+.text { font-size: 20px; line-height: 1.9; word-break: break-word; }
+.text.pending { color: var(--text-muted); font-size: 14px; }
+.text.error { color: var(--bad); font-size: 13px; }
+.alt { margin-top: 4px; font-size: 12px; color: var(--text-muted); }
+.alt summary { cursor: pointer; }
+.alt dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 6px 0 0; }
+.alt dt { color: var(--text-secondary); }
+.alt dd { margin: 0; font-size: 15px; color: var(--text-primary); word-break: break-word; }

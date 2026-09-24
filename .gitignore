@@ -16,3 +16,6 @@ __pycache__/
 
 # generated viewer (rebuild with visualize_dataset.py)
 visualize/
+
+# line detector: its own repo (handwritten-det-ocr)
+detection/
