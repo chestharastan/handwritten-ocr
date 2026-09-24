@@ -111,6 +111,8 @@ Then run:
 | `backup_supabase.py` | Back up Supabase tables and Storage images to `database/` |
 | `prepare_dataset.py` | Join annotations with page images and crop line images into `dataset/` |
 | `train.py` | Model definition, training loop and evaluation |
+| `finetune_trocr.py` | Fine-tune a pretrained Khmer TrOCR model instead (see TRAINING.md) |
+| `finetune.sh`, `finetune.bat` | One-step setup and fine-tuning |
 | `synth.py` | Synthetic Khmer line generator (`python synth.py` writes a preview) |
 | `fonts/` | Khmer fonts for synthetic lines (SIL Open Font License, see `fonts/licenses/`) |
 | `train.sh`, `train.bat` | One-step setup and training on Linux/macOS or Windows |

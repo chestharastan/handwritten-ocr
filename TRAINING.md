@@ -65,6 +65,26 @@ Validation CER should keep going down for much longer than before. Expect the fu
 - **Preview synthetic lines**: `.venv/bin/python synth.py` writes `synth_samples.png`.
 - **In the log**, `synth 0.60` is the share of synthetic batches in that epoch. Loss jumps a little while the mix changes. Judge progress by `val ... CER`.
 
+## Fine-tuning a pretrained model (TrOCR)
+
+Instead of training from scratch, you can fine-tune **TrOCR**, a pretrained image-to-text Transformer that has already been trained on Khmer text by the community. It uses the same data, box jitter, augmentation and synthetic lines as `train.py`.
+
+```bash
+./finetune.sh                     # Linux/macOS (finetune.bat on Windows)
+./finetune.sh --resume            # continue after stopping
+./finetune.sh --eval-only         # test-set CER of checkpoints/trocr/best
+.venv/bin/python finetune_trocr.py --predict dataset/lines/184.jpg
+```
+
+- **Default model:** [`lkhapple/Khmer-TrOCR-OCR`](https://huggingface.co/lkhapple/Khmer-TrOCR-OCR), with 334M parameters. Its tokenizer is the most efficient for Khmer: a median of 48 tokens per line, and 103 for the longest line. Unchanged, it gets about 82% of characters wrong on these lines, so fine-tuning is essential.
+- **Lighter option:** `./finetune.sh --model channudam/khmer-trocr-base-printed --batch 8` (150M parameters, trained on printed text).
+- **Folded lines:** TrOCR always sees 384×384 pixels. Each long line is cut into 2–5 pieces that are stacked, so letters are not squashed. `--no-fold` turns this off.
+- **Memory on 6 GB:** it uses bf16, gradient checkpointing, batch 4 × 4 accumulation steps and 8-bit AdamW. The script installs `bitsandbytes` for 8-bit AdamW if it can, and uses Adafactor otherwise. If you still run out of memory, use `--batch 2 --accum 8`.
+- **Time:** the default is 20 epochs, evaluated on val after every epoch, which takes a few hours on a 3060.
+- **Output:** `checkpoints/trocr/best/` (lowest val CER) and `checkpoints/trocr/last/` (for `--resume`). Each is about 1.3 GB. Compare the final `test CER` with `train.py`'s model.
+- **Licence:** these community checkpoints don't state a licence. Check with their authors before using them in something you publish.
+- The web app and `predict.py` still use the `train.py` model. Test the TrOCR model with `--eval-only` or `--predict`.
+
 ## 1. Prepare data (before a new training run)
 
 ```bash

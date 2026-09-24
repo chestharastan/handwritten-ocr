@@ -3,3 +3,4 @@ pillow
 numpy
 psycopg[binary]
 khmer-nltk
+transformers>=4.46
