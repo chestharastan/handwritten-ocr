@@ -6,13 +6,21 @@ frames, a Transformer encoder contextualises them, and a Transformer decoder
 generates the text one character at a time. An auxiliary CTC head on the
 encoder speeds up and stabilises training on small datasets.
 
+Training data: the real line crops, each shown with a randomly loose or tight
+box (crops keep page context, so parts of neighbouring lines appear, as with
+a line detector's boxes), plus synthetic lines rendered from Khmer fonts
+(synth.py). Synthetic lines make up a large share of early epochs and a small
+share later, so the model first learns the glyphs, then the handwriting.
+
 Usage:
     python train.py                     # train with defaults
     python train.py --epochs 200 --batch-size 16
+    python train.py --init checkpoints/best.pt   # start from a trained model
+    python train.py --synth-start 0     # real lines only
     python train.py --resume            # continue from checkpoints/last.pt
     python train.py --eval-only         # evaluate checkpoints/best.pt on test
 
-Input comes from prepare_dataset.py (dataset/train.tsv, val.tsv, test.tsv).
+Input comes from prepare_dataset.py (dataset/train.tsv, val.tsv, test.tsv, boxes.json).
 """
 
 import os
@@ -20,6 +28,8 @@ import os
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # CTC loss has no MPS kernel
 
 import argparse
+import io
+import json
 import math
 import random
 import time
@@ -29,13 +39,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "dataset"
 CKPT_DIR = ROOT / "checkpoints"
+
+PAD_RATIO = 0.08  # standard margin around a box (prepare_dataset.py, the web app's detector boxes)
 
 PAD, SOS, EOS, UNK = 0, 1, 2, 3  # PAD doubles as the CTC blank
 SPECIALS = ["<pad>", "<sos>", "<eos>", "<unk>"]
@@ -98,6 +110,38 @@ def wave(img: Image.Image) -> Image.Image:
     return Image.fromarray(np.where(inside, a[rows.clip(0, h - 1), np.arange(w)[None]], 255).astype(np.uint8))
 
 
+def elastic(img: Image.Image) -> Image.Image:
+    """Warp the line with small random displacements on a coarse grid: shaky, uneven strokes."""
+    w, h = img.size
+    nx, ny = max(2, round(w / h * 2)), 2
+    amp = h * random.uniform(0.02, 0.05)
+    xs, ys = np.linspace(0, w, nx + 1), np.linspace(0, h, ny + 1)
+    off = np.random.default_rng(random.getrandbits(32)).uniform(-amp, amp, (ny + 1, nx + 1, 2))
+    off[[0, -1]] = 0  # keep the top and bottom edges straight so no paper is pulled in
+    mesh = []
+    for j in range(ny):
+        for i in range(nx):
+            box = (round(xs[i]), round(ys[j]), round(xs[i + 1]), round(ys[j + 1]))
+            src = lambda jj, ii: (xs[ii] + off[jj, ii, 0], ys[jj] + off[jj, ii, 1])
+            quad = (*src(j, i), *src(j + 1, i), *src(j + 1, i + 1), *src(j, i + 1))
+            mesh.append((box, quad))
+    return img.transform(img.size, Image.MESH, mesh, Image.BILINEAR, fillcolor=255)
+
+
+def scribble(img: Image.Image) -> Image.Image:
+    """Stray marks found on real pages: a ruled line, a teacher's tick or underline."""
+    img = img.copy()
+    d, w, h = ImageDraw.Draw(img), img.width, img.height
+    if random.random() < 0.6:
+        y = h * random.uniform(0.6, 1.0)
+        d.line([(0, y), (w, y + random.uniform(-3, 3))], fill=random.randint(80, 170), width=random.randint(1, 3))
+    else:
+        x, y = random.uniform(0, w), random.uniform(0.2 * h, 0.9 * h)
+        pts = [(x, y), (x + h * 0.15, y + h * 0.2), (x + h * random.uniform(0.3, 0.6), y - h * 0.3)]
+        d.line(pts, fill=random.randint(90, 180), width=random.randint(2, 4), joint="curve")
+    return img
+
+
 def augment(img: Image.Image) -> Image.Image:
     # every geometric transform fills with white (255) so no fake ink appears at the edges
     if random.random() < 0.5:  # slant: writers lean their letters differently
@@ -108,14 +152,23 @@ def augment(img: Image.Image) -> Image.Image:
     if random.random() < 0.5:
         img = img.rotate(random.uniform(-2, 2), resample=Image.BILINEAR, expand=True, fillcolor=255)
     if random.random() < 0.3:
+        img = elastic(img)
+    if random.random() < 0.3:
         img = wave(img)
     if random.random() < 0.5:  # horizontal stretch / squeeze
         img = img.resize((max(8, int(img.width * random.uniform(0.8, 1.2))), img.height), Image.BILINEAR)
-    if random.random() < 0.5:  # vertical shift and loose / tight horizontal margins
-        dy = img.height * random.uniform(-0.08, 0.08)
-        left, right = (int(img.height * random.uniform(-0.1, 0.3)) for _ in range(2))
+    if random.random() < 0.3:  # vertical shift and loose / tight horizontal margins
+        dy = img.height * random.uniform(-0.05, 0.05)
+        left, right = (int(img.height * random.uniform(-0.1, 0.2)) for _ in range(2))
         img = img.transform((max(8, img.width + left + right), img.height), Image.AFFINE,
                             (1, 0, -left, 0, 1, dy), Image.BILINEAR, fillcolor=255)
+    if random.random() < 0.15:
+        img = scribble(img)
+    if random.random() < 0.3:  # uneven lighting across the line
+        a = np.asarray(img, dtype=np.float32)
+        ramp = np.linspace(0, 1, a.shape[1])[None, :] if random.random() < 0.7 else np.linspace(0, 1, a.shape[0])[:, None]
+        a = a * (1 - random.uniform(0.1, 0.4) * (ramp if random.random() < 0.5 else 1 - ramp))
+        img = Image.fromarray(a.clip(0, 255).astype(np.uint8))
     if random.random() < 0.5:
         img = ImageEnhance.Contrast(img).enhance(random.uniform(0.6, 1.4))
         img = ImageEnhance.Brightness(img).enhance(random.uniform(0.8, 1.2))
@@ -127,34 +180,79 @@ def augment(img: Image.Image) -> Image.Image:
         a = np.asarray(img, dtype=np.float32)
         a = a + np.random.default_rng(random.getrandbits(32)).normal(0, random.uniform(3, 15), a.shape)
         img = Image.fromarray(a.clip(0, 255).astype(np.uint8))
+    if random.random() < 0.2:  # low-resolution photo
+        f = random.uniform(0.35, 0.7)
+        small = img.resize((max(8, int(img.width * f)), max(8, int(img.height * f))), Image.BILINEAR)
+        img = small.resize(img.size, Image.BILINEAR)
+    if random.random() < 0.2:  # JPEG artefacts
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=random.randint(30, 85))
+        img = Image.open(io.BytesIO(buf.getvalue())).convert("L")
     return img
 
 
+def load_boxes() -> dict[str, list[float]]:
+    """Where the labeled box sits inside each context crop (empty for old datasets without context)."""
+    path = DATA_DIR / "boxes.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def crop_box(img: Image.Image, box, left, top, right, bottom) -> Image.Image:
+    """Crop the box plus margins given as fractions of the box height (negative = tighter)."""
+    x0, y0, x1, y1 = box
+    h = y1 - y0
+    region = (max(0, x0 - left * h), max(0, y0 - top * h), min(img.width, x1 + right * h), min(img.height, y1 + bottom * h))
+    return img.crop(tuple(round(v) for v in region))
+
+
 class LineDataset(Dataset):
-    def __init__(self, rows, tokenizer, height, max_width, train):
+    """Real line crops; indices past the real lines are synthetic lines (see MixedBatchSampler)."""
+
+    def __init__(self, rows, tokenizer, height, max_width, train, boxes=None, synth=None, batch_size=16):
         self.rows, self.tok = rows, tokenizer
         self.height, self.max_width, self.train = height, max_width, train
+        self.boxes, self.synth, self.batch_size = boxes or {}, synth, batch_size
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
-        path, text = self.rows[i]
-        img = Image.open(path).convert("L")
+        if i >= len(self.rows):
+            img, text = self.synthetic(i - len(self.rows))
+        else:
+            path, text = self.rows[i]
+            img = Image.open(path).convert("L")
+            box = self.boxes.get(path.relative_to(DATA_DIR).as_posix())
+            if box:
+                if self.train and random.random() < 0.75:  # loose or tight box, often showing neighbouring lines
+                    img = crop_box(img, box, random.uniform(0, 0.4), random.uniform(-0.03, 0.25),
+                                   random.uniform(0, 0.4), random.uniform(-0.03, 0.25))
+                else:
+                    img = crop_box(img, box, *[PAD_RATIO] * 4)
         if self.train:
             img = augment(img)
         return load_line(img, self.height, self.max_width), self.tok.encode(text), text
+
+    def synthetic(self, k):
+        # lines in one synthetic batch share a target length, so they have similar widths
+        target = random.Random(k // self.batch_size).randint(4, 110)
+        return self.synth.sample(random.Random(k), target)
 
 
 class WidthBucketSampler(Sampler):
     """Batches lines of similar width together so little compute is wasted on padding."""
 
-    def __init__(self, rows, batch_size, shuffle):
+    def __init__(self, rows, batch_size, shuffle, boxes=None):
         self.batch_size, self.shuffle = batch_size, shuffle
         self.aspects = []
         for path, _ in rows:
-            with Image.open(path) as im:
-                self.aspects.append(im.width / im.height)
+            box = (boxes or {}).get(path.relative_to(DATA_DIR).as_posix())
+            if box:
+                h = box[3] - box[1]
+                self.aspects.append((box[2] - box[0] + 2 * PAD_RATIO * h) / (h * (1 + 2 * PAD_RATIO)))
+            else:
+                with Image.open(path) as im:
+                    self.aspects.append(im.width / im.height)
 
     def __iter__(self):
         idx = list(range(len(self.aspects)))
@@ -171,6 +269,32 @@ class WidthBucketSampler(Sampler):
 
     def __len__(self):
         return math.ceil(len(self.aspects) / self.batch_size)
+
+
+class MixedBatchSampler(Sampler):
+    """Real batches plus a share of synthetic batches that changes per epoch (set_epoch)."""
+
+    def __init__(self, real: WidthBucketSampler, n_real: int, batch_size: int, ratio):
+        self.real, self.n_real, self.batch_size, self.ratio = real, n_real, batch_size, ratio
+        self.epoch = 1
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def n_synth(self, epoch):
+        return round(len(self.real) * self.ratio(epoch))
+
+    def __iter__(self):
+        batches = list(self.real)
+        # a fresh random block of synthetic ids each epoch, so every epoch sees new lines
+        base = self.n_real + random.randrange(10**9) * self.batch_size
+        batches += [[base + (b * self.batch_size) + j for j in range(self.batch_size)]
+                    for b in range(self.n_synth(self.epoch))]
+        random.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        return len(self.real) + self.n_synth(self.epoch)
 
 
 def round_up(n, multiple):
@@ -349,7 +473,7 @@ def pick_device(name):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--epochs", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
@@ -362,9 +486,17 @@ def main():
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     p.add_argument("--device", default="auto")
     p.add_argument("--no-amp", action="store_true", help="disable bf16 mixed precision on CUDA")
+    p.add_argument("--synth-start", type=float, default=1.0,
+                   help="synthetic batches per real batch in epoch 1 (0 disables synthetic lines)")
+    p.add_argument("--synth-end", type=float, default=0.2, help="synthetic batches per real batch at the end")
+    p.add_argument("--synth-decay", type=int, default=0,
+                   help="epochs to go from --synth-start to --synth-end (default: half of --epochs)")
+    p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. checkpoints/best.pt)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true")
     args = p.parse_args()
+    # checkpoints store the options; plain types only, so torch.load(weights_only=True) can read them
+    saved_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
 
     torch.manual_seed(0)
     random.seed(0)
@@ -376,13 +508,32 @@ def main():
     print(f"Device {device}{' (bf16)' if amp else ''} | vocab {len(tok)} | "
           + " | ".join(f"{s} {len(r)}" for s, r in splits.items()))
 
+    boxes = load_boxes()
+    if not boxes:
+        print("dataset/boxes.json not found: crops have no page context. Re-run prepare_dataset.py for best results.")
+
+    synth = None
+    if args.synth_start > 0 or args.synth_end > 0:
+        from synth import SynthLines, shaping_available
+        if shaping_available():
+            synth = SynthLines([t for _, t in splits["train"]])  # training text only: nothing from val/test
+            print(f"Synthetic lines: {len(synth.fonts)} fonts, {args.synth_start:g} -> {args.synth_end:g} per real batch")
+        else:
+            print("WARNING: Pillow has no libraqm, so Khmer can't be rendered. Training without synthetic lines.")
+    decay = args.synth_decay or max(1, args.epochs // 2)
+    synth_ratio = lambda e: 0.0 if synth is None else (
+        args.synth_start + (args.synth_end - args.synth_start) * min(1.0, (e - 1) / decay))
+
     def loader(split, train):
-        ds = LineDataset(splits[split], tok, args.height, args.max_width, train)
-        sampler = WidthBucketSampler(splits[split], args.batch_size, shuffle=train)
+        ds = LineDataset(splits[split], tok, args.height, args.max_width, train, boxes, synth, args.batch_size)
+        sampler = WidthBucketSampler(splits[split], args.batch_size, shuffle=train, boxes=boxes)
+        if train:
+            sampler = MixedBatchSampler(sampler, len(splits[split]), args.batch_size, synth_ratio)
         return DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=args.workers,
                           persistent_workers=args.workers > 0, pin_memory=device.type == "cuda")
 
     train_dl, val_dl, test_dl = loader("train", True), loader("val", False), loader("test", False)
+    train_sampler = train_dl.batch_sampler
 
     model = OCRTransformer(len(tok), height=args.height, dropout=args.dropout).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
@@ -392,6 +543,15 @@ def main():
     eval_model = ema.module if ema else model
     CKPT_DIR.mkdir(exist_ok=True)
 
+    if args.init and not args.resume and not args.eval_only:
+        ckpt = torch.load(args.init, map_location=device)
+        if ckpt.get("charset") and ckpt["charset"] != tok.itos[len(SPECIALS):]:
+            raise SystemExit(f"{args.init} was trained with a different charset.txt; it can't be used with --init.")
+        model.load_state_dict(ckpt["model"])
+        if ema:
+            ema.module.load_state_dict(ckpt["model"])
+        print(f"Initialised from {args.init} (epoch {ckpt.get('epoch')}, val CER {ckpt.get('val_cer', float('nan')):.4f})")
+
     if args.eval_only:
         ckpt = torch.load(CKPT_DIR / "best.pt", map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -400,7 +560,8 @@ def main():
         return
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total = args.epochs * len(train_dl)
+    # epochs get shorter as the synthetic share shrinks, so count the real number of steps
+    total = sum(len(train_sampler.real) + train_sampler.n_synth(e) for e in range(1, args.epochs + 1))
     warmup = max(1, min(1000, total // 10))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
@@ -420,6 +581,7 @@ def main():
     ctc_device = torch.device("cpu") if device.type == "mps" else device  # no CTC kernel on MPS
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        train_sampler.set_epoch(epoch)
         t0, total_loss = time.time(), 0.0
         for step, (x, widths, y, _) in enumerate(train_dl, 1):
             x, widths, y = (t.to(device, non_blocking=True) for t in (x, widths, y))
@@ -445,7 +607,7 @@ def main():
             if step % 20 == 0:
                 print(f"  epoch {epoch} step {step}/{len(train_dl)} | loss {total_loss / step:.4f} | "
                       f"{(time.time() - t0) / step:.2f}s/step", flush=True)
-        msg = (f"epoch {epoch:3d} | loss {total_loss / len(train_dl):.4f} | "
+        msg = (f"epoch {epoch:3d} | loss {total_loss / len(train_dl):.4f} | synth {synth_ratio(epoch):.2f} | "
                f"lr {sched.get_last_lr()[0]:.2e} | {time.time() - t0:.0f}s")
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
@@ -457,13 +619,13 @@ def main():
             if cer < best_cer:
                 best_cer = cer
                 torch.save({"model": eval_model.state_dict(), "charset": tok.itos[len(SPECIALS):],
-                            "args": vars(args), "epoch": epoch, "val_cer": cer, "decoder": decoder},
+                            "args": saved_args, "epoch": epoch, "val_cer": cer, "decoder": decoder},
                            CKPT_DIR / "best.pt")
                 msg += f"  * saved best ({decoder})"
         print(msg, flush=True)
         torch.save({"model": model.state_dict(), "ema": ema.state_dict() if ema else None,
                     "opt": opt.state_dict(), "sched": sched.state_dict(),
-                    "epoch": epoch, "best_cer": best_cer, "args": vars(args)}, CKPT_DIR / "last.pt")
+                    "epoch": epoch, "best_cer": best_cer, "args": saved_args}, CKPT_DIR / "last.pt")
 
     ckpt = torch.load(CKPT_DIR / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])

@@ -2,8 +2,8 @@
 """Read text from line images with the trained model.
 
 Usage:
-    python predict.py path/to/line.png [more.png ...]
-    python predict.py --decoder ctc path/to/line.png     # force the CTC head
+    python predict.py path/to/line.jpg [more.jpg ...]
+    python predict.py --decoder ctc path/to/line.jpg     # force the CTC head
 """
 
 import argparse

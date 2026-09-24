@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train the Khmer handwriting model on an NVIDIA GPU (Linux) or a Mac.
 #
-#   ./train.sh                  new run (previous checkpoints are moved to checkpoints/old_<time>/)
+#   ./train.sh                  new run (previous checkpoints are backed up to checkpoints/old_<time>/)
 #   ./train.sh --resume         continue from checkpoints/last.pt
 #   ./train.sh --height 96      any train.py option is passed through
 #
@@ -22,9 +22,9 @@ fi
 
 if [[ " $* " != *" --resume "* ]] && ls checkpoints/*.pt >/dev/null 2>&1; then
   old="checkpoints/old_$(date +%Y%m%d_%H%M%S)"
-  mkdir -p "$old" && mv checkpoints/*.pt "$old"/
+  mkdir -p "$old" && cp -p checkpoints/*.pt "$old"/   # copy: --init and the web app still use checkpoints/
   [ -f train.log ] && mv train.log "$old"/
-  echo "Moved previous checkpoints to $old"
+  echo "Backed up previous checkpoints to $old"
 fi
 
 .venv/bin/python -u train.py "$@" 2>&1 | tee -a train.log

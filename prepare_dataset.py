@@ -5,10 +5,16 @@ Reads the newest database/<timestamp>/ table backup, joins annotations with
 their page images in database/storage/Document/images/, crops every
 annotated text line and writes:
 
-    dataset/lines/<annotation_id>.png   grayscale line crops
+    dataset/lines/<annotation_id>.jpg   grayscale line crops with page context around the box
+    dataset/boxes.json                   where the labeled box sits in each crop
     dataset/train.tsv, val.tsv, test.tsv  "<image path>\t<text>" per line
     dataset/charset.txt                  every character in the labels
     dataset/stats.json                   counts, for reference
+
+Each crop keeps CONTEXT_RATIO of the box height of page around the box, so
+training can vary how loose the box is and show parts of neighbouring lines,
+like the boxes a line detector produces. Crops are scaled so that the box
+plus the standard PAD_RATIO margin is CROP_HEIGHT pixels high.
 
 Splits are made per page (not per line) so lines from one page never land in
 both train and test.
@@ -36,8 +42,9 @@ BACKUP_DIR = ROOT / "database"
 IMAGES_DIR = BACKUP_DIR / "storage" / "Document" / "images"
 OUT_DIR = ROOT / "dataset"
 
-CROP_HEIGHT = 128   # saved crops are resized to this height (training uses less)
-PAD_RATIO = 0.08    # extra margin around each box, as a fraction of box height
+CROP_HEIGHT = 128     # the box plus PAD_RATIO margin is resized to this height (training uses less)
+PAD_RATIO = 0.08      # standard margin around each box, as a fraction of box height
+CONTEXT_RATIO = 0.35  # page kept around each box in the saved crop, as a fraction of box height
 MAX_TEXT_LEN = 200  # longer labels are usually multi-line paragraph boxes
 SPLIT = (0.8, 0.1, 0.1)
 SEED = 42
@@ -89,23 +96,26 @@ def main() -> None:
             continue
         by_page[ann["image_id"]].append((ann, text))
 
-    rows = {}
+    rows, boxes = {}, {}
     for page_id, anns in sorted(by_page.items(), key=lambda kv: int(kv[0])):
         page = Image.open(IMAGES_DIR / images[page_id]["filename"]).convert("L")
         pw, ph = page.size
         for ann, text in anns:
             x, y, w, h = (float(ann[k]) for k in ("x", "y", "width", "height"))
-            pad = h * PAD_RATIO
-            box = (max(0, x - pad), max(0, y - pad), min(pw, x + w + pad), min(ph, y + h + pad))
-            if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            x0, y0, x1, y1 = max(0.0, x), max(0.0, y), min(float(pw), x + w), min(float(ph), y + h)
+            if x1 - x0 < 8 or y1 - y0 < 8:
                 dropped["box too small"] += 1
                 continue
-            crop = page.crop(tuple(round(v) for v in box))
-            new_w = max(1, round(crop.width * CROP_HEIGHT / crop.height))
-            crop = crop.resize((new_w, CROP_HEIGHT), Image.BILINEAR)
-            path = OUT_DIR / "lines" / f"{ann['id']}.png"
-            crop.save(path)
-            rows.setdefault(page_id, []).append((path.relative_to(OUT_DIR).as_posix(), text))
+            ctx = h * CONTEXT_RATIO
+            region = [round(v) for v in (max(0, x0 - ctx), max(0, y0 - ctx), min(pw, x1 + ctx), min(ph, y1 + ctx))]
+            scale = CROP_HEIGHT / (h * (1 + 2 * PAD_RATIO))
+            crop = page.crop(region)
+            crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.BILINEAR)
+            rel = f"lines/{ann['id']}.jpg"
+            crop.save(OUT_DIR / rel, quality=90)
+            boxes[rel] = [round((x0 - region[0]) * scale, 1), round((y0 - region[1]) * scale, 1),
+                          round((x1 - region[0]) * scale, 1), round((y1 - region[1]) * scale, 1)]
+            rows.setdefault(page_id, []).append((rel, text))
         print(f"  page {page_id}: {len(anns)} lines")
 
     pages = sorted(rows, key=int)
@@ -128,6 +138,7 @@ def main() -> None:
                 chars.update(text)
         stats["splits"][name] = {"pages": len(page_ids), "lines": len(lines)}
 
+    (OUT_DIR / "boxes.json").write_text(json.dumps(boxes, separators=(",", ":")))
     (OUT_DIR / "charset.txt").write_text("".join(sorted(chars)), encoding="utf-8")
     stats["charset_size"] = len(chars)
     (OUT_DIR / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False))

@@ -46,6 +46,25 @@ train.bat                  # Windows: new run
 - A new run first moves the old `checkpoints/*.pt` and `train.log` into `checkpoints/old_<time>/`, so earlier models are kept.
 - Progress is shown on screen and appended to `train.log`.
 
+## Getting better results (recommended runs)
+
+The default run already does the following:
+- It shows each real line with a random loose or tight box, so it learns to ignore parts of neighbouring lines.
+- It mixes in synthetic lines from Khmer fonts: many at first, fewer later.
+- It uses heavy augmentation, and runs 400 epochs.
+
+Validation CER should keep going down for much longer than before. Expect the full run to take several hours on an RTX 3060.
+
+```bash
+./train.sh                                        # full run from scratch (best, slowest)
+./train.sh --init checkpoints/best.pt --epochs 150 --synth-start 0.5   # continue from your current model (faster)
+./train.sh --height 96                            # taller input: more detail for stacked vowels/subscripts
+```
+
+- **Check synthetic lines work**: the log should show `Synthetic lines: 14 fonts, 1 -> 0.2 per real batch`. If you see `Pillow has no libraqm`, Khmer can't be drawn correctly on that machine, and training continues on real lines only. Pillow's standard wheels for Windows, Linux and macOS include libraqm.
+- **Preview synthetic lines**: `.venv/bin/python synth.py` writes `synth_samples.png`.
+- **In the log**, `synth 0.60` is the share of synthetic batches in that epoch. Loss jumps a little while the mix changes. Judge progress by `val ... CER`.
+
 ## 1. Prepare data (before a new training run)
 
 ```bash
@@ -102,7 +121,7 @@ nohup .venv/bin/python -u train.py --resume >> train.log 2>&1 &
 
 ```bash
 .venv/bin/python train.py --eval-only                 # CER on the test set (uses best.pt)
-.venv/bin/python predict.py dataset/lines/184.png      # read one line image
+.venv/bin/python predict.py dataset/lines/184.jpg      # read one line image
 ```
 
 ## Files

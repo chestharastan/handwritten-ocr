@@ -1,7 +1,7 @@
 @echo off
 rem Train the Khmer handwriting model on an NVIDIA GPU (Windows).
 rem
-rem   train.bat                 new run (previous checkpoints are moved to checkpoints\old_<time>\)
+rem   train.bat                 new run (previous checkpoints are backed up to checkpoints\old_<time>\)
 rem   train.bat --resume        continue from checkpoints\last.pt
 rem   train.bat --height 96     any train.py option is passed through
 rem
@@ -22,9 +22,9 @@ echo %* | findstr /c:"--resume" >nul
 if errorlevel 1 if exist checkpoints\*.pt (
   for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set OLD=checkpoints\old_%%t
   mkdir "!OLD!"
-  move checkpoints\*.pt "!OLD!\" >nul
+  copy /y checkpoints\*.pt "!OLD!\" >nul
   if exist train.log move train.log "!OLD!\" >nul
-  echo Moved previous checkpoints to !OLD!
+  echo Backed up previous checkpoints to !OLD!
 )
 
 rem PowerShell Tee-Object shows progress and also writes train.log
