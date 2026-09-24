@@ -57,6 +57,7 @@ See **[TRAINING.md](TRAINING.md)** for running in the background, stopping and r
 ```bash
 .venv/bin/python train.py --eval-only                  # test-set CER using checkpoints/best.pt
 .venv/bin/python predict.py dataset/lines/184.png       # read one line image
+.venv/bin/python predict.py --decoder ctc dataset/lines/184.png   # force the CTC head
 ```
 
 Main training options:
@@ -102,6 +103,7 @@ Then run:
 | `backup_supabase.py` | Back up Supabase tables and Storage images to `database/` |
 | `prepare_dataset.py` | Join annotations with page images and crop line images into `dataset/` |
 | `train.py` | Model definition, training loop and evaluation |
+| `train.sh`, `train.bat` | One-step setup and training on Linux/macOS or Windows |
 | `predict.py` | Run the trained model on line images |
 | `TRAINING.md` | How to train, stop and resume |
 

@@ -30,6 +30,22 @@ Recommended settings for a 6 GB card:
 
 On Windows, use `.venv\Scripts\python` and run training in its own terminal window instead of `nohup ... &`.
 
+## Quick train script
+
+`train.sh` (Linux/macOS) and `train.bat` (Windows) do the setup and training in one step:
+
+```bash
+./train.sh                 # Linux/macOS: new run
+train.bat                  # Windows: new run
+./train.sh --resume        # continue from checkpoints/last.pt
+./train.sh --height 96     # any train.py option is passed through
+```
+
+- The first run creates `.venv` and installs PyTorch (CUDA build on Linux and Windows).
+- It prints the GPU name, or `not available`, which means training will be slow on the CPU.
+- A new run first moves the old `checkpoints/*.pt` and `train.log` into `checkpoints/old_<time>/`, so earlier models are kept.
+- Progress is shown on screen and appended to `train.log`.
+
 ## 1. Prepare data (before a new training run)
 
 ```bash
